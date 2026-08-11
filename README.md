@@ -1,27 +1,62 @@
 # FileZipper
 
-A small cross-platform Python 3.11+ command-line program that puts one file
-of any type into an AES-encrypted ZIP archive. It can optionally split the
-encrypted archive into numbered chunks and join those chunks again when
-decrypting.
+FileZipper creates AES-encrypted ZIP archives and puts them in one shared
+`./filezipper` directory. FileBrowser Quantum provides the web interface for
+browsing that directory and for creating folders, uploading, renaming, moving,
+and deleting archive files. FileZipper does **not** decrypt user archives.
 
-## Features
+## Design
 
-- Handles text, images, videos, documents, and other binary files without
-  changing their contents.
-- Uses an AES-encrypted ZIP format through the single external dependency
-  [`pyzipper`](https://pypi.org/project/pyzipper/).
-- Accepts paths with or without matching single/double quotes.
-- Accepts forward-slash and backslash path separators on every supported OS.
-- Recognizes shell-escaped spaces, such as `/Users/me/Untitled\ 1.wav`.
-- Splits the encrypted ZIP after encryption, so individual chunks are not
-  useful without the password and all chunks.
-- Stores only a salted password verifier, never the password itself.
+- Every source file becomes an archive named with a UUID, for example
+  `550e8400-e29b-41d4-a716-446655440000.zip`.
+- Split archives use the same UUID followed by `.zip.part001`,
+  `.zip.part002`, and so on.
+- `./filezipper/metadata.zip` is the one metadata file. It contains an
+  encrypted `metadata.json` member mapping each UUID to its original filename,
+  archive parts, source size, and chunk size.
+- The metadata ZIP uses AES and the exact same password as the source archives.
+  The original filename is therefore not exposed by the metadata file.
+- The CLI never asks for an output directory. It always writes to
+  `./filezipper`, relative to the directory from which it is run.
+- FileBrowser is deliberately an external, established file manager rather
+  than a file browser implemented in this project. Its own persistent SQLite
+  database stores browser users and its search index; it is separate from the
+  encrypted FileZipper metadata.
+
+The metadata records the UUID and filenames, not a permanent directory path.
+Therefore a UUID archive can be moved into a FileBrowser folder without
+changing the mapping. Move every part of a split archive together, and keep
+`metadata.zip` at the root of the FileZipper source.
+
+## File browser research and choice
+
+**Selected: [FileBrowser Quantum](https://github.com/gtsteffaniak/filebrowser)**
+
+It is a modern, responsive, self-hosted web file manager and an actively
+maintained fork of the original
+[File Browser](https://github.com/filebrowser/filebrowser) project. Quantum
+supports a local filesystem source, persistent password authentication, folder
+creation, upload/download, rename, move, delete, search, and per-source
+permissions. It has Docker images for macOS/Windows Docker Desktop and Linux
+on both `amd64` and `arm64`.
+
+The original File Browser also satisfies the basic file-management
+requirements, but Quantum is the better fit here because it adds a more modern
+UI, active search, more authentication options, and a documented YAML
+configuration. Relevant primary documentation:
+
+- [Quantum project](https://github.com/gtsteffaniak/filebrowser)
+- [Docker setup](https://filebrowserquantum.com/en/docs/getting-started/docker/)
+- [Source configuration](https://filebrowserquantum.com/en/docs/configuration/sources/)
+- [User management and per-source permissions](https://filebrowserquantum.com/en/docs/configuration/users/)
+
+This repository includes a pinned integration shape in `docker-compose.yml`
+and `filebrowser/config.yaml`. The browser receives only `./filezipper`, not
+the rest of the project.
 
 ## Installation
 
-From this directory, create a virtual environment if desired and install the
-dependency:
+Create a virtual environment if desired and install the Python dependency:
 
 ```bash
 python3 -m venv .venv
@@ -34,74 +69,110 @@ python3 -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-Python 3.11 or newer is supported. The program has also been written to work
-with Python 3.14.
+Python 3.11 or newer is supported.
 
-## Run the program
+## Start FileBrowser
+
+Docker and Docker Compose are required for the web browser integration.
+
+```bash
+mkdir -p filezipper filebrowser/data
+cp .env.example .env
+```
+
+On Linux, edit `.env` and set `FILEBROWSER_UID` and `FILEBROWSER_GID` to the
+user/group that own the mounted directories (the values from `id -u` and
+`id -g`). This lets FileBrowser create folders and move files. Docker Desktop
+usually handles the bind-mount permissions without this change.
+
+Start the browser:
+
+```bash
+docker compose up -d
+```
+
+Open <http://localhost:8080>. On a new Quantum installation, use the initial
+credentials shown by the container (the quick-start default is `admin` /
+`admin`), then immediately change the administrator password in the web UI.
+Do not expose this development HTTP endpoint directly to the internet; put it
+behind HTTPS and a reverse proxy for remote access.
+
+The Compose file persists `/home/filebrowser/data`, which keeps the browser
+account, index, and configuration across restarts. The browser session is
+held in its normal web session cookie, so you log in once and can then use the
+folder and move operations without logging in for each operation. Logging out,
+clearing cookies, or an expired session requires a new login. The FileBrowser
+login is intentionally separate from the FileZipper encryption password; the
+latter is never passed to Docker or stored in the repository.
+
+The browser user needs `view`, `download`, `modify`, `create`, and `delete`
+permissions for the `Encrypted archives` source. The initial administrator has
+these permissions. If a non-admin user is created, grant the permissions in
+**User Management** → the source scope.
+
+## Run FileZipper
 
 ```bash
 python filezipper.py
 ```
 
-The program will:
+The program asks for:
 
-1. Ask whether to encrypt and zip, or decrypt an existing ZIP.
-2. Ask for the input path. You can paste paths such as
-   `"/home/me/My File.pdf"`, `/Users/me/Untitled\ 1.wav`, or
-   `C:\Users\me\My File.pdf`. A backslash before a space is treated as an
-   escaped space rather than as a directory separator.
-3. When encrypting, ask whether the encrypted ZIP should be split. If yes,
-   enter a chunk size in megabytes; decimal values such as `0.5` are accepted.
-4. Ask for a destination directory, creating it if necessary.
+1. the source file path;
+2. whether to split the encrypted archive; and
+3. a chunk size in megabytes when splitting is enabled.
 
-The first run asks for a password twice and creates a verifier at
-`~/.filezipper/config.json` (or the path in the `FILEZIPPER_CONFIG` environment
-variable). On later runs the password is requested for each operation. This is
-intentional: the actual password is not stored, so losing it means the archive
-cannot be decrypted.
+It then asks for the encryption password and writes all output to
+`./filezipper`. There is no decrypt action and no output-path prompt. The first
+run asks for a password twice and creates a salted verifier at
+`~/.filezipper/config.json` (or the path in `FILEZIPPER_CONFIG`). On later runs
+the password is requested for each invocation. The verifier cannot recover a
+lost password.
 
-### Example output
-
-For an input file named `photo.jpg`, without splitting, the output is:
+Example output for `photo.jpg`:
 
 ```text
-photo.jpg.zip
+Created in ./filezipper:
+  filezipper/550e8400-e29b-41d4-a716-446655440000.zip
+Metadata index: filezipper/metadata.zip
 ```
 
-With splitting, the output is similar to:
+For a split file, all parts share the same UUID:
 
 ```text
-photo.jpg.zip.part001
-photo.jpg.zip.part002
-photo.jpg.zip.part003
+550e8400-e29b-41d4-a716-446655440000.zip.part001
+550e8400-e29b-41d4-a716-446655440000.zip.part002
 ```
 
-To decrypt split output, select decrypt and enter the path to any existing
-chunk (the first chunk is easiest). The program finds all sibling chunks,
-checks that numbering starts at 1 with no gaps, combines them temporarily,
-and writes the original file to the selected destination directory.
+`metadata.zip` must not be renamed, deleted, or edited in FileBrowser. It is
+updated by FileZipper whenever a new archive is created. Do not delete or
+rename any part of a split archive.
 
 ## Tests
 
-The tests use Python's standard `unittest` module. Install the dependency
-first, then run:
+Install the dependency first, then run:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The tests cover path normalization, binary content, AES ZIP encryption and
-decryption, splitting and rejoining chunks, password setup/verification, and
-missing chunk detection.
+The tests cover path normalization, chunking, UUID archive names, encrypted
+metadata and password matching, collision protection, password setup, the
+absence of the decrypt workflow, and the fact that the CLI has no destination
+prompt. The Docker and FileBrowser files are configuration rather than a
+second file-browser implementation.
 
-## Security and format notes
+## Security notes
 
-- The ZIP archive is encrypted with AES; it is not merely renamed or hidden.
-- A password verifier is saved with restrictive permissions where the
-  operating system supports them. It cannot be used to recover the password.
-- Do not delete or rename any chunk. A split archive requires every numbered
-  chunk.
-- The program intentionally handles one input file per archive. It rejects an
-  archive containing zero or multiple files when decrypting.
-- Existing output files are not overwritten. Choose an empty destination or
-  move the previous output first.
+- Archives and metadata use AES through
+  [`pyzipper`](https://pypi.org/project/pyzipper/).
+- A salted PBKDF2-HMAC-SHA256 password verifier is stored with restrictive
+  permissions where supported; the plaintext password is not stored.
+- UUID names hide original filenames from the FileBrowser listing, but anyone
+  with access to an archive can still download it. UUIDs are identifiers, not
+  encryption.
+- Do not expose FileBrowser directly to the public internet. Use TLS, a
+  reverse proxy, and strong separate browser credentials.
+- The project intentionally does not contain a user-file decryption command.
+  Restoring an archive requires an external AES-ZIP-compatible tool or a
+  separately controlled recovery workflow.

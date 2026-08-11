@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Encrypt a file into an AES-encrypted ZIP archive, or decrypt one.
+"""Create AES-encrypted ZIP archives for the FileBrowser-backed archive folder.
 
-The command-line interface is intentionally small, while the file operations
-are exposed as functions so they can also be tested or reused by another
-program.
+The command-line interface only creates archives. FileBrowser Quantum manages
+folders and file operations for the archive folder; this module deliberately
+does not decrypt user archives.
 """
 
 from __future__ import annotations
@@ -14,13 +14,11 @@ import hmac
 import json
 import math
 import os
-import re
 import secrets
-import shutil
 import sys
-import tempfile
+import uuid
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 try:
     import pyzipper
@@ -28,9 +26,15 @@ except ImportError:  # pragma: no cover - exercised by an installation error
     pyzipper = None  # type: ignore[assignment]
 
 
-APP_NAME = "filezipper"
 PASSWORD_ITERATIONS = 600_000
-CHUNK_PATTERN = re.compile(r"^(?P<base>.+)\.part(?P<number>\d+)$")
+
+# The CLI intentionally has no destination prompt.  Keeping this relative to
+# the working directory makes the promised ``./filezipper`` location explicit
+# and also makes the Docker Compose bind mount predictable.
+ARCHIVE_DIRECTORY = Path("filezipper")
+METADATA_FILENAME = "metadata.zip"
+METADATA_MEMBER_NAME = "metadata.json"
+METADATA_VERSION = 1
 
 
 def normalize_path(value: str | os.PathLike[str]) -> Path:
@@ -107,8 +111,10 @@ def _ensure_directory(value: str | os.PathLike[str]) -> Path:
     return directory
 
 
-def _archive_path(source: Path, destination: Path) -> Path:
-    return destination / f"{source.name}.zip"
+def _archive_path(archive_id: str, destination: Path) -> Path:
+    """Return the archive path for a UUID-based archive identifier."""
+
+    return destination / f"{archive_id}.zip"
 
 
 def split_file(file_path: str | os.PathLike[str], chunk_size: int) -> list[Path]:
@@ -170,80 +176,94 @@ def split_file(file_path: str | os.PathLike[str], chunk_size: int) -> list[Path]
     return chunk_paths
 
 
-def _chunk_base(path: Path) -> tuple[Path, int] | None:
-    match = CHUNK_PATTERN.fullmatch(path.name)
-    if not match:
-        return None
-    base = path.with_name(match.group("base"))
-    if base.suffix.lower() != ".zip":
-        raise ValueError(f"Chunk does not belong to a .zip archive: {path}")
-    return base, int(match.group("number"))
+def _empty_metadata() -> dict[str, Any]:
+    return {"version": METADATA_VERSION, "files": {}}
 
 
-def find_archive_parts(
-    archive_or_chunk: str | os.PathLike[str],
-) -> list[Path]:
-    """Find a complete archive or all contiguous chunks for an archive.
-
-    A chunk path may be any member of the set, although the interactive UI
-    asks for the first chunk.  Numbering must start at 1 and have no gaps.
-    """
-
-    supplied = _as_path(archive_or_chunk)
-    if not supplied.is_file():
-        raise FileNotFoundError(f"File not found: {supplied}")
-
-    chunk_info = _chunk_base(supplied)
-    if chunk_info is None:
-        return [supplied]
-
-    base, _ = chunk_info
-    candidates: dict[int, Path] = {}
-    prefix = f"{base.name}.part"
-    for candidate in base.parent.iterdir():
-        if not candidate.is_file() or not candidate.name.startswith(prefix):
-            continue
-        match = CHUNK_PATTERN.fullmatch(candidate.name)
-        if match and match.group("base") == base.name:
-            candidates[int(match.group("number"))] = candidate
-
-    if not candidates:
-        raise FileNotFoundError(f"No chunks found for {base}")
-
-    numbers = sorted(candidates)
-    if not numbers or numbers[0] != 1:
-        raise ValueError("Archive chunk numbering must start at 1")
-
-    expected = list(range(1, max(candidates) + 1))
-    if numbers != expected:
-        missing = sorted(set(expected) - set(candidates))
-        missing_text = ", ".join(str(number) for number in missing)
-        raise ValueError(f"Missing archive chunk(s): {missing_text}")
-    return [candidates[number] for number in expected]
+def _metadata_path(destination: Path) -> Path:
+    return destination / METADATA_FILENAME
 
 
-def _check_archive_output_available(archive_path: Path, chunk_size: int | None) -> None:
-    paths = [archive_path]
-    if chunk_size is not None:
-        # The exact number of chunks is not known until the ZIP is written;
-        # split_file performs the definitive per-chunk collision check.
-        paths = [archive_path]
-    for path in paths:
-        if path.exists():
-            raise FileExistsError(f"Output already exists: {path}")
+def _load_metadata(metadata_path: Path, password: str) -> dict[str, Any]:
+    """Load the one encrypted metadata document, or return an empty one."""
+
+    _require_pyzipper()
+    if not metadata_path.exists():
+        return _empty_metadata()
+
+    try:
+        with pyzipper.AESZipFile(metadata_path, mode="r") as zip_file:
+            zip_file.setpassword(password.encode("utf-8"))
+            members = [member for member in zip_file.infolist() if not member.is_dir()]
+            if len(members) != 1 or members[0].filename != METADATA_MEMBER_NAME:
+                raise ValueError(
+                    f"{METADATA_FILENAME} must contain exactly {METADATA_MEMBER_NAME}"
+                )
+            metadata = json.loads(zip_file.read(members[0]).decode("utf-8"))
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Cannot read encrypted metadata at {metadata_path}; "
+            "check the encryption password and do not replace the metadata file"
+        ) from error
+
+    if not isinstance(metadata, dict) or metadata.get("version") != METADATA_VERSION:
+        raise ValueError(f"Unsupported metadata format in {metadata_path}")
+    if not isinstance(metadata.get("files"), dict):
+        raise ValueError(f"Invalid metadata file: {metadata_path}")
+    return metadata
+
+
+def _save_metadata(metadata_path: Path, metadata: dict[str, Any], password: str) -> None:
+    """Atomically replace the encrypted metadata ZIP."""
+
+    _require_pyzipper()
+    temporary_path = metadata_path.with_name(
+        f".{metadata_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with pyzipper.AESZipFile(
+            temporary_path,
+            mode="w",
+            compression=pyzipper.ZIP_DEFLATED,
+            encryption=pyzipper.WZ_AES,
+        ) as zip_file:
+            zip_file.setpassword(password.encode("utf-8"))
+            zip_file.writestr(
+                METADATA_MEMBER_NAME,
+                json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True).encode(
+                    "utf-8"
+                ),
+            )
+        temporary_path.replace(metadata_path)
+        try:
+            metadata_path.chmod(0o600)
+        except OSError:
+            # chmod is not meaningful on some Windows file systems.
+            pass
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def encrypt_file(
     source_file: str | os.PathLike[str],
-    destination_directory: str | os.PathLike[str],
     password: str,
     chunk_size: int | None = None,
+    *,
+    destination_directory: str | os.PathLike[str] = ARCHIVE_DIRECTORY,
 ) -> list[Path]:
-    """Create an AES-encrypted ZIP containing one file.
+    """Create a UUID-named AES-encrypted ZIP and update encrypted metadata.
 
-    Returns the resulting ZIP path, or the paths of all chunks when
-    ``chunk_size`` is provided.  File contents are copied in binary mode, so
-    text and binary file types are handled identically.
+    The destination argument is keyword-only so the command-line interface
+    cannot accidentally turn it into a user prompt.  The CLI always uses
+    ``./filezipper``; the keyword remains useful for isolated tests and for
+    callers embedding the encryption function.
+
+    The returned paths are either the UUID ZIP or all of its numbered chunks.
+    The original filename is stored only in ``metadata.zip``, which is itself
+    AES-encrypted with the same password.
     """
 
     _require_pyzipper()
@@ -258,9 +278,14 @@ def encrypt_file(
         raise ValueError("Chunk size must be a positive integer number of bytes")
 
     destination = _ensure_directory(destination_directory)
-    archive = _archive_path(source, destination)
-    _check_archive_output_available(archive, chunk_size)
+    metadata_path = _metadata_path(destination)
+    metadata = _load_metadata(metadata_path, password)
+    archive_id = str(uuid.uuid4())
+    archive = _archive_path(archive_id, destination)
+    if archive.exists():
+        raise FileExistsError(f"Output already exists: {archive}")
 
+    created_paths: list[Path] = [archive]
     try:
         with pyzipper.AESZipFile(
             archive,
@@ -269,90 +294,31 @@ def encrypt_file(
             encryption=pyzipper.WZ_AES,
         ) as zip_file:
             zip_file.setpassword(password.encode("utf-8"))
-            zip_file.write(source, arcname=source.name)
+            # Keep the source name out of the archive directory as well as
+            # out of the FileBrowser-visible filename.  The encrypted
+            # metadata index is the source of truth for the original name.
+            zip_file.write(source, arcname=archive_id)
 
-        if chunk_size is None:
-            return [archive]
-
-        return split_file(archive, chunk_size)
+        outputs = [archive] if chunk_size is None else split_file(archive, chunk_size)
+        created_paths = [archive, *outputs]
+        metadata["files"][archive_id] = {
+            "uuid": archive_id,
+            "original_filename": source.name,
+            "archive_files": [output.name for output in outputs],
+            "size_bytes": source.stat().st_size,
+            "chunk_size_bytes": chunk_size,
+        }
+        _save_metadata(metadata_path, metadata, password)
+        return outputs
     except Exception:
-        # Do not leave a partially written un-split archive behind.  Chunks
-        # are cleaned by split_file itself if it fails.
-        if archive.exists():
+        # Metadata is written atomically.  If it cannot be updated, do not
+        # leave an archive whose UUID is absent from the metadata index.
+        for path in created_paths:
             try:
-                archive.unlink()
+                path.unlink()
             except OSError:
                 pass
         raise
-
-
-def _safe_member_name(member_name: str) -> str:
-    # This application creates one top-level file.  Taking only the final
-    # component also prevents a malicious archive from writing outside the
-    # selected destination directory.
-    name = Path(member_name).name
-    if not name or name in {".", ".."}:
-        raise ValueError("The archive contains an invalid file name")
-    return name
-
-
-def _join_chunks(parts: Iterable[Path], output: Path) -> None:
-    with output.open("wb") as combined:
-        for part in parts:
-            with part.open("rb") as source:
-                shutil.copyfileobj(source, combined, length=1024 * 1024)
-
-
-def decrypt_file(
-    archive_or_chunk: str | os.PathLike[str],
-    destination_directory: str | os.PathLike[str],
-    password: str,
-) -> Path:
-    """Decrypt an encrypted ZIP (or its numbered chunks) into a directory."""
-
-    _require_pyzipper()
-    if not isinstance(password, str) or not password:
-        raise ValueError("Password must not be empty")
-
-    parts = find_archive_parts(archive_or_chunk)
-    destination = _ensure_directory(destination_directory)
-    temporary_directory: tempfile.TemporaryDirectory[str] | None = None
-    archive = parts[0]
-
-    try:
-        if len(parts) > 1:
-            temporary_directory = tempfile.TemporaryDirectory(prefix=f"{APP_NAME}-")
-            archive = Path(temporary_directory.name) / "combined.zip"
-            _join_chunks(parts, archive)
-
-        with pyzipper.AESZipFile(archive, mode="r") as zip_file:
-            zip_file.setpassword(password.encode("utf-8"))
-            members = [member for member in zip_file.infolist() if not member.is_dir()]
-            if len(members) != 1:
-                raise ValueError(
-                    "The archive must contain exactly one file; "
-                    f"found {len(members)}"
-                )
-
-            member = members[0]
-            output = destination / _safe_member_name(member.filename)
-            if output.exists():
-                raise FileExistsError(f"Output already exists: {output}")
-
-            try:
-                with zip_file.open(member, mode="r") as source, output.open("xb") as target:
-                    shutil.copyfileobj(source, target, length=1024 * 1024)
-            except Exception:
-                if output.exists():
-                    try:
-                        output.unlink()
-                    except OSError:
-                        pass
-                raise
-            return output
-    finally:
-        if temporary_directory is not None:
-            temporary_directory.cleanup()
 
 
 class PasswordManager:
@@ -426,18 +392,6 @@ class PasswordManager:
             print("Incorrect password. Please try again.")
 
 
-def _prompt_action() -> str:
-    while True:
-        choice = input(
-            "Choose an action: [e]ncrypt and zip a file, or [d]ecrypt an existing zip: "
-        ).strip().lower()
-        if choice in {"e", "encrypt", "1"}:
-            return "encrypt"
-        if choice in {"d", "decrypt", "2"}:
-            return "decrypt"
-        print("Please enter e/encrypt or d/decrypt.")
-
-
 def _prompt_existing_file(prompt: str) -> Path:
     while True:
         path = normalize_path(input(prompt))
@@ -465,37 +419,18 @@ def _prompt_chunk_size() -> int:
             print(error)
 
 
-def _prompt_destination() -> Path:
-    while True:
-        destination = normalize_path(input("Directory where the output should be saved: "))
-        try:
-            return _ensure_directory(destination)
-        except (OSError, ValueError) as error:
-            print(f"Cannot use that directory: {error}")
-
-
 def main() -> int:
     print("FileZipper - AES-encrypted ZIP files")
     try:
-        action = _prompt_action()
-        if action == "encrypt":
-            source = _prompt_existing_file("Path to the file to encrypt and zip: ")
-            split = _prompt_yes_no("Do you want the encrypted ZIP split into chunks?")
-            chunk_size = _prompt_chunk_size() if split else None
-            password = PasswordManager().get_password()
-            destination = _prompt_destination()
-            outputs = encrypt_file(source, destination, password, chunk_size)
-            print("Created:")
-            for output in outputs:
-                print(f"  {output}")
-        else:
-            archive = _prompt_existing_file(
-                "Path to the encrypted .zip or one of its .zip.partNNN chunks: "
-            )
-            password = PasswordManager().get_password()
-            destination = _prompt_destination()
-            output = decrypt_file(archive, destination, password)
-            print(f"Decrypted file: {output}")
+        source = _prompt_existing_file("Path to the file to encrypt and zip: ")
+        split = _prompt_yes_no("Do you want the encrypted ZIP split into chunks?")
+        chunk_size = _prompt_chunk_size() if split else None
+        password = PasswordManager().get_password()
+        outputs = encrypt_file(source, password, chunk_size)
+        print(f"Created in ./{ARCHIVE_DIRECTORY}:")
+        for output in outputs:
+            print(f"  {output}")
+        print(f"Metadata index: {ARCHIVE_DIRECTORY / METADATA_FILENAME}")
         return 0
     except KeyboardInterrupt:
         print("\nCancelled.")

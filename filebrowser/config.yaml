@@ -1,0 +1,20 @@
+# FileBrowser Quantum configuration. Paths are inside the container.
+server:
+  database:
+    path: /home/filebrowser/data/filebrowser.sqlite
+  sources:
+    - path: /archives
+      name: Encrypted archives
+      config:
+        defaultEnabled: true
+        defaultUserScope: /
+        defaultPermissions:
+          view: true
+          download: true
+          modify: true
+          create: true
+          delete: true
+
+http:
+  address: 0.0.0.0
+  port: 80
